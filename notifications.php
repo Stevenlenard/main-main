@@ -130,7 +130,7 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['action'])) {
 }
 
 // --------------------
-// Load notifications and fallback (bins, janitors, contact messages)
+// Load notifications and fallback (bins, janitors, contact tables)
 // --------------------
 $notifications = []; // unified list
 
@@ -149,6 +149,58 @@ function push_notification_array(&$list, $id, $type, $title, $message, $created_
         'janitor_name' => $janitor_name,
         'admin_name' => null
     ];
+}
+
+// Utility: check if a column exists in a table (works for PDO or mysqli)
+function column_exists_in_table($table, $column) {
+    global $pdo, $conn;
+    try {
+        if (isset($pdo) && $pdo instanceof PDO) {
+            $r = $pdo->query("SHOW COLUMNS FROM `{$table}` LIKE " . $pdo->quote($column));
+            return ($r && $r->rowCount() > 0);
+        } else {
+            $r = $conn->query("SHOW COLUMNS FROM `{$table}` LIKE '{$column}'");
+            return ($r && $r->num_rows > 0);
+        }
+    } catch (Exception $e) {
+        return false;
+    }
+}
+
+// Try to detect password change via common tables (password_resets / password_history) for a janitor at a given timestamp
+function janitor_password_changed_at($janitor_id, $timestamp) {
+    global $pdo, $conn;
+    if (!$janitor_id || !$timestamp) return false;
+    $date = date('Y-m-d H:i:s', strtotime($timestamp));
+    $candidateTables = ['password_resets', 'password_history', 'janitor_password_changes'];
+    foreach ($candidateTables as $tbl) {
+        try {
+            if (isset($pdo) && $pdo instanceof PDO) {
+                $r = $pdo->query("SHOW TABLES LIKE " . $pdo->quote($tbl));
+                if (!($r && $r->rowCount() > 0)) continue;
+                // Try to find an entry matching janitor_id and same or near timestamp (allow small tolerance)
+                $stmt = $pdo->prepare("SELECT COUNT(*) AS c FROM {$tbl} WHERE (janitor_id = :jid OR user_id = :jid) AND (created_at BETWEEN :t1 AND :t2) LIMIT 1");
+                $t1 = date('Y-m-d H:i:s', strtotime($date) - 5);
+                $t2 = date('Y-m-d H:i:s', strtotime($date) + 5);
+                $stmt->execute([':jid' => $janitor_id, ':t1' => $t1, ':t2' => $t2]);
+                $c = (int)$stmt->fetchColumn();
+                if ($c > 0) return true;
+            } else {
+                $r = $conn->query("SHOW TABLES LIKE '{$tbl}'");
+                if (!($r && $r->num_rows > 0)) continue;
+                $t1 = date('Y-m-d H:i:s', strtotime($date) - 5);
+                $t2 = date('Y-m-d H:i:s', strtotime($date) + 5);
+                $qr = $conn->query("SELECT COUNT(*) AS c FROM {$tbl} WHERE (janitor_id = " . intval($janitor_id) . " OR user_id = " . intval($janitor_id) . ") AND (created_at BETWEEN '{$t1}' AND '{$t2}') LIMIT 1");
+                if ($qr) {
+                    $row = $qr->fetch_assoc();
+                    if (!empty($row['c']) && intval($row['c']) > 0) return true;
+                }
+            }
+        } catch (Exception $e) {
+            // ignore and continue
+        }
+    }
+    return false;
 }
 
 try {
@@ -288,28 +340,88 @@ try {
     }
 
     // 3) recent janitors
+    // Detect password changes using multiple heuristics; the user requested to rely on reset_token_hash if present.
+    $hasPasswordChangedColumn = column_exists_in_table('janitors', 'password_changed_at');
+    $hasResetHashColumn = column_exists_in_table('janitors', 'reset_token_hash');
+
     if (isset($pdo) && $pdo instanceof PDO) {
-        $stmt = $pdo->query("SELECT janitor_id, first_name, last_name, email, created_at, updated_at FROM janitors ORDER BY GREATEST(created_at, IFNULL(updated_at, '1970-01-01')) DESC LIMIT 50");
+        $selectCols = "janitor_id, first_name, last_name, email, created_at, updated_at";
+        if ($hasPasswordChangedColumn) $selectCols .= ", password_changed_at";
+        if ($hasResetHashColumn) $selectCols .= ", reset_token_hash";
+        $stmt = $pdo->query("SELECT {$selectCols} FROM janitors ORDER BY GREATEST(created_at, IFNULL(updated_at, '1970-01-01')) DESC LIMIT 50");
         $janitors = $stmt->fetchAll(PDO::FETCH_ASSOC);
     } else {
+        $selectCols = "janitor_id, first_name, last_name, email, created_at, updated_at";
+        if ($hasPasswordChangedColumn) $selectCols .= ", password_changed_at";
+        if ($hasResetHashColumn) $selectCols .= ", reset_token_hash";
         $janitors = [];
-        $res = $conn->query("SELECT janitor_id, first_name, last_name, email, created_at, updated_at FROM janitors ORDER BY COALESCE(updated_at, created_at) DESC LIMIT 50");
+        $res = $conn->query("SELECT {$selectCols} FROM janitors ORDER BY COALESCE(updated_at, created_at) DESC LIMIT 50");
         if ($res) while ($r = $res->fetch_assoc()) $janitors[] = $r;
     }
+
     foreach ($janitors as $j) {
         $jid = (int)$j['janitor_id'];
         $full = trim(($j['first_name'] ?? '') . ' ' . ($j['last_name'] ?? ''));
         if ($full === '') $full = $j['email'] ?? "Janitor #{$jid}";
+
         $createdFinger = md5("janitor_created::{$jid}::" . ($j['created_at'] ?? ''));
         if (!isset($presentJanitors[$jid]) && !isset($presentMessages[$createdFinger])) {
             push_notification_array($notifications, null, 'new_janitor', "New janitor account: " . $full, "A new janitor account was created: " . $full . ".", $j['created_at'] ?? null);
             $presentJanitors[$jid] = true;
             $presentMessages[$createdFinger] = true;
         }
+
         if (!empty($j['updated_at']) && $j['updated_at'] !== $j['created_at']) {
             $updatedFinger = md5("janitor_updated::{$jid}::" . ($j['updated_at'] ?? ''));
+
+            // Determine whether the update was a password change or a profile update.
+            $passwordChanged = false;
+
+            // 1) If the janitors table has a dedicated password_changed_at column and it matches updated_at
+            if ($hasPasswordChangedColumn && !empty($j['password_changed_at'])) {
+                $pc = date('Y-m-d H:i:s', strtotime($j['password_changed_at']));
+                $ua = date('Y-m-d H:i:s', strtotime($j['updated_at']));
+                if ($pc === $ua) {
+                    $passwordChanged = true;
+                }
+            }
+
+            // 2) If a reset_token_hash column exists, and there's a reset_token_hash present at update time,
+            //    treat that as an indicator that a password-reset/change occurred (per request).
+            //    Heuristic: prefer this indicator if reset_token_hash is non-empty and updated_at changed.
+            if (!$passwordChanged && $hasResetHashColumn) {
+                // If reset_token_hash exists in row and updated_at != created_at, assume password change occurred.
+                // Note: this is a heuristic because we cannot access historical value here; it's based on the user's instruction.
+                if (!empty($j['reset_token_hash']) && (!empty($j['updated_at']) && $j['updated_at'] !== $j['created_at'])) {
+                    $passwordChanged = true;
+                }
+            }
+
+            // 3) Fallback: try to detect via common password tables (password_resets, password_history, janitor_password_changes)
+            if (!$passwordChanged) {
+                if (janitor_password_changed_at($jid, $j['updated_at'])) {
+                    $passwordChanged = true;
+                }
+            }
+
             if (!isset($presentMessages[$updatedFinger])) {
-                push_notification_array($notifications, null, 'warning', "Janitor profile updated: " . $full, "{$full} updated their profile.", $j['updated_at'] ?? null);
+                if ($passwordChanged) {
+                    // Security notification: password changed
+                    push_notification_array(
+                        $notifications,
+                        null,
+                        'security',
+                        "Changed password: " . $full,
+                        "{$full} changed their password.",
+                        $j['updated_at'] ?? null,
+                        0,
+                        null,
+                        $jid
+                    );
+                } else {
+                    // Regular profile update
+                    push_notification_array($notifications, null, 'warning', "Janitor profile updated: " . $full, "{$full} updated their profile.", $j['updated_at'] ?? null, 0, null, $jid);
+                }
                 $presentMessages[$updatedFinger] = true;
             }
         }

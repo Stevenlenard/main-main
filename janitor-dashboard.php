@@ -16,6 +16,176 @@ if (!isJanitor()) {
 // determine janitor id from session (best-effort)
 $janitorId = intval($_SESSION['janitor_id'] ?? $_SESSION['user_id'] ?? $_SESSION['id'] ?? 0);
 
+/**
+ * POST endpoint for janitors to update bin status.
+ * Accepts: action=janitor_edit_status, bin_id, status, action_type (optional)
+ * - updates bins table (status + capacity mapping)
+ * - inserts admin notification
+ * - inserts a bin_history/bin_logs entry if table exists (best-effort)
+ */
+if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['action']) && $_POST['action'] === 'janitor_edit_status') {
+    header('Content-Type: application/json; charset=utf-8');
+
+    try {
+        if (!$janitorId) throw new Exception('Unauthorized');
+
+        $bin_id = intval($_POST['bin_id'] ?? 0);
+        $status = trim($_POST['status'] ?? '');
+        $actionType = trim($_POST['action_type'] ?? $_POST['actionType'] ?? '');
+
+        // normalize legacy value
+        if ($status === 'in_progress') $status = 'half_full';
+
+        $valid_statuses = ['empty', 'half_full', 'full', 'needs_attention', 'disabled', 'out_of_service'];
+        if (!in_array($status, $valid_statuses, true)) {
+            throw new Exception('Invalid status value');
+        }
+
+        // map capacity where applicable
+        $capacity_map = [
+            'empty' => 10,
+            'half_full' => 50,
+            'full' => 90,
+            'needs_attention' => null,
+            'disabled' => null,
+            'out_of_service' => null
+        ];
+        $capacity = $capacity_map[$status] ?? null;
+
+        // Update bins table (status and capacity if applicable)
+        if ($capacity !== null) {
+            $stmt = $conn->prepare("UPDATE bins SET status = ?, capacity = ?, updated_at = NOW() WHERE bin_id = ?");
+            if (!$stmt) throw new Exception('Prepare failed: ' . $conn->error);
+            $stmt->bind_param("sii", $status, $capacity, $bin_id);
+        } else {
+            $stmt = $conn->prepare("UPDATE bins SET status = ?, updated_at = NOW() WHERE bin_id = ?");
+            if (!$stmt) throw new Exception('Prepare failed: ' . $conn->error);
+            $stmt->bind_param("si", $status, $bin_id);
+        }
+
+        if (!$stmt->execute()) {
+            $err = $stmt->error;
+            $stmt->close();
+            throw new Exception('Execute failed: ' . $err);
+        }
+        $affected = $stmt->affected_rows;
+        $stmt->close();
+
+        // Resolve janitor name
+        $janitor_name = null;
+        if ($janitorId > 0) {
+            if (isset($pdo) && $pdo instanceof PDO) {
+                try {
+                    $aStmt = $pdo->prepare("SELECT first_name, last_name FROM janitors WHERE janitor_id = ? LIMIT 1");
+                    $aStmt->execute([(int)$janitorId]);
+                    $aRow = $aStmt->fetch(PDO::FETCH_ASSOC);
+                    if ($aRow) $janitor_name = trim(($aRow['first_name'] ?? '') . ' ' . ($aRow['last_name'] ?? ''));
+                } catch (Exception $e) { /* ignore */ }
+            } else {
+                if ($stmtA = $conn->prepare("SELECT first_name, last_name FROM janitors WHERE janitor_id = ? LIMIT 1")) {
+                    $stmtA->bind_param("i", $janitorId);
+                    $stmtA->execute();
+                    $r2 = $stmtA->get_result()->fetch_assoc();
+                    if ($r2) $janitor_name = trim(($r2['first_name'] ?? '') . ' ' . ($r2['last_name'] ?? ''));
+                    $stmtA->close();
+                }
+            }
+        }
+        if (empty($janitor_name)) $janitor_name = $janitorId ? "Janitor #{$janitorId}" : 'A janitor';
+
+        // Get bin code for message
+        $bin_code = null;
+        if ($bin_id > 0) {
+            if (isset($pdo) && $pdo instanceof PDO) {
+                try {
+                    $bstmt = $pdo->prepare("SELECT bin_code FROM bins WHERE bin_id = ? LIMIT 1");
+                    $bstmt->execute([(int)$bin_id]);
+                    $brow = $bstmt->fetch(PDO::FETCH_ASSOC);
+                    if ($brow) $bin_code = $brow['bin_code'] ?? null;
+                } catch (Exception $e) { /* ignore */ }
+            } else {
+                $res = $conn->query("SELECT bin_code FROM bins WHERE bin_id = " . intval($bin_id) . " LIMIT 1");
+                if ($res && $row = $res->fetch_assoc()) $bin_code = $row['bin_code'] ?? null;
+            }
+        }
+        $binDisplay = $bin_code ? "Bin '{$bin_code}'" : "Bin #{$bin_id}";
+
+        // Build notification message (include actionType if provided)
+        $notificationType = 'info';
+        $statusText = ucfirst(str_replace('_', ' ', $status));
+        $title = "{$binDisplay} status updated";
+        $message = "{$janitor_name} updated status to \"{$statusText}\".";
+        if (!empty($actionType)) $message .= " Action: {$actionType}.";
+
+        // Insert notification (PDO or mysqli)
+        try {
+            if (isset($pdo) && $pdo instanceof PDO) {
+                $stmtN = $pdo->prepare("
+                    INSERT INTO notifications (admin_id, janitor_id, bin_id, notification_type, title, message, created_at)
+                    VALUES (:admin_id, :janitor_id, :bin_id, :type, :title, :message, NOW())
+                ");
+                $stmtN->execute([
+                    ':admin_id' => null,
+                    ':janitor_id' => $janitorId,
+                    ':bin_id' => $bin_id,
+                    ':type' => $notificationType,
+                    ':title' => $title,
+                    ':message' => $message
+                ]);
+            } else {
+                if ($conn->query("SHOW TABLES LIKE 'notifications'")->num_rows > 0) {
+                    $stmtN = $conn->prepare("
+                        INSERT INTO notifications (admin_id, janitor_id, bin_id, notification_type, title, message, created_at)
+                        VALUES (?, ?, ?, ?, ?, ?, NOW())
+                    ");
+                    if ($stmtN) {
+                        $adminParam = null;
+                        $janitorParam = $janitorId;
+                        $binParam = (int)$bin_id;
+                        $typeParam = $notificationType;
+                        $titleParam = $title;
+                        $messageParam = $message;
+                        $stmtN->bind_param("iiisss", $adminParam, $janitorParam, $binParam, $typeParam, $titleParam, $messageParam);
+                        $stmtN->execute();
+                        $stmtN->close();
+                    }
+                }
+            }
+        } catch (Exception $e) {
+            error_log("[janitor_dashboard] notification insert failed: " . $e->getMessage());
+        }
+
+        // Best-effort: insert into bin_history or bin_logs if table exists (no notes)
+        try {
+            if ($conn->query("SHOW TABLES LIKE 'bin_history'")->num_rows > 0) {
+                $hstmt = $conn->prepare("INSERT INTO bin_history (bin_id, janitor_id, status, action_type, created_at) VALUES (?, ?, ?, ?, NOW())");
+                if ($hstmt) {
+                    $hstmt->bind_param("iiss", $bin_id, $janitorId, $status, $actionType);
+                    $hstmt->execute();
+                    $hstmt->close();
+                }
+            } elseif ($conn->query("SHOW TABLES LIKE 'bin_logs'")->num_rows > 0) {
+                $hstmt = $conn->prepare("INSERT INTO bin_logs (bin_id, performed_by, action, status, created_at) VALUES (?, ?, ?, ?, NOW())");
+                if ($hstmt) {
+                    $act = $actionType ?: 'status_update';
+                    $hstmt->bind_param("iiss", $bin_id, $janitorId, $act, $status);
+                    $hstmt->execute();
+                    $hstmt->close();
+                }
+            }
+        } catch (Exception $e) {
+            error_log("[janitor_dashboard] bin history insert failed: " . $e->getMessage());
+        }
+
+        echo json_encode(['success' => true, 'status' => $status, 'affected' => $affected]);
+        exit;
+    } catch (Exception $e) {
+        http_response_code(400);
+        echo json_encode(['success' => false, 'message' => $e->getMessage()]);
+        exit;
+    }
+}
+
 // ----------------- AJAX endpoint to return janitor dashboard stats -----------------
 if ($_SERVER['REQUEST_METHOD'] === 'GET' && isset($_GET['action']) && $_GET['action'] === 'get_dashboard_stats') {
     $dashboard_bins = [];
@@ -53,7 +223,6 @@ if ($_SERVER['REQUEST_METHOD'] === 'GET' && isset($_GET['action']) && $_GET['act
             $pendingTasks = $fullBins;
 
             // completed today: best-effort attempt - check common table names
-            // try 'tasks', 'task_history', 'bin_logs', 'activities' for a completed/emptied action
             $completedToday = 0;
             $todayStart = date('Y-m-d') . ' 00:00:00';
             $todayEnd = date('Y-m-d') . ' 23:59:59';
@@ -69,7 +238,6 @@ if ($_SERVER['REQUEST_METHOD'] === 'GET' && isset($_GET['action']) && $_GET['act
                 $r = $conn->query($sql);
                 if ($r && $row = $r->fetch_assoc()) {
                     $completedToday = intval($row['c'] ?? 0);
-                    // if we found any reasonable result (including zero), accept it and break
                     break;
                 }
             }
@@ -105,7 +273,7 @@ try {
         $r = $conn->query("SELECT COUNT(*) AS c FROM bins WHERE assigned_to = " . intval($janitorId));
         if ($r && $row = $r->fetch_assoc()) $assignedBins = intval($row['c'] ?? 0);
 
-        $r = $conn->query("SELECT COUNT(*) AS c FROM bins WHERE assigned_to = " . intval($janitorId) . " AND (status = 'full' OR (capacity IS NOT NULL AND capacity >= 100))");
+        $r = $conn->query("SELECT COUNT(*) AS c FROM bins WHERE assigned_to = " . intval($janitorId) . " AND (bins.status = 'full' OR (bins.capacity IS NOT NULL AND bins.capacity >= 100))");
         if ($r && $row = $r->fetch_assoc()) $fullBins = intval($row['c'] ?? 0);
 
         $pendingTasks = $fullBins;
@@ -126,7 +294,6 @@ try {
         }
 
         // NOTE: Show all assigned bins in the Recent Alerts table per request.
-        // Previously we filtered only true 'alerts' (full/needs_attention). Now show all assigned bins.
         $recent_alerts = $dashboard_bins;
 
         // completed today (same heuristic as AJAX)
@@ -162,6 +329,23 @@ try {
   <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.5.0/css/all.min.css">
   <link rel="stylesheet" href="css/bootstrap.min.css">
   <link rel="stylesheet" href="css/janitor-dashboard.css">
+  <style>
+    .bin-detail-header {
+      display:flex;
+      align-items:center;
+      justify-content:space-between;
+      gap:1rem;
+    }
+    .bin-status-badge { font-size:0.9rem; padding: .45rem .65rem; }
+    .bin-detail-grid { display:grid; grid-template-columns:1fr 1fr; gap:1rem; }
+    @media (max-width:576px){ .bin-detail-grid{grid-template-columns:1fr;} }
+    .map-placeholder { background:#f7f7f7; height:140px; display:flex; align-items:center; justify-content:center; color:#888; border-radius:6px; }
+
+    /* Small fixes for assigned bins action dropdown clipping */
+    .table-responsive { overflow: visible !important; }
+    .action-buttons { position: relative; display:flex; gap:.5rem; align-items:center; justify-content:flex-end; }
+    .action-buttons .dropdown-menu { min-width: 220px; max-width: 350px; z-index: 2000; }
+  </style>
 </head>
 <body>
   <!-- Premium Header with Animated Logo -->
@@ -358,7 +542,7 @@ try {
                 <li><hr class="dropdown-divider"></li>
                 <li><a class="dropdown-item" href="#" data-filter="needs_attention">Needs Attention</a></li>
                 <li><a class="dropdown-item" href="#" data-filter="full">Full</a></li>
-                <li><a class="dropdown-item" href="#" data-filter="in_progress">In Progress</a></li>
+                <li><a class="dropdown-item" href="#" data-filter="half_full">Half Full</a></li>
                 <li><a class="dropdown-item" href="#" data-filter="empty">Empty</a></li>
               </ul>
             </div>
@@ -386,7 +570,7 @@ try {
                   </tr>
                   <?php else: ?>
                     <?php foreach ($dashboard_bins as $b): ?>
-                      <tr>
+                      <tr data-bin-id="<?php echo intval($b['bin_id']); ?>" data-status="<?php echo htmlspecialchars($b['status'] ?? ''); ?>">
                         <td><strong><?php echo htmlspecialchars($b['bin_code'] ?? $b['bin_id']); ?></strong></td>
                         <td><?php echo htmlspecialchars($b['location'] ?? ''); ?></td>
                         <td><?php echo htmlspecialchars($b['type'] ?? ''); ?></td>
@@ -419,426 +603,10 @@ try {
         </div>
       </section>
 
-      <!-- Task History Section -->
-      <section id="taskHistorySection" class="content-section" style="display:none;">
-        <div class="section-header">
-          <div>
-            <h1 class="page-title">Task History</h1>
-            <p class="page-subtitle">View your completed and ongoing tasks.</p>
-          </div>
-            <div class="d-flex gap-2">
-            <div class="input-group" style="max-width: 200px;">
-              <span class="input-group-text bg-white"><i class="fas fa-calendar-alt text-muted"></i></span>
-              <input type="date" class="form-control" id="historyDateFilter">
-            </div>
-            <button class="btn btn-primary btn-sm filter-btn" id="filterHistoryBtn"><i class="fas fa-filter me-1"></i>Apply Filters</button>
-          </div>
-        </div>
-
-        <div class="card">
-          <div class="card-body p-0">
-            <div class="table-responsive">
-              <table class="table mb-0">
-                <thead>
-                  <tr>
-                    <th>Date & Time</th>
-                    <th>Bin ID</th>
-                    <th>Location</th>
-                    <th>Action</th>
-                    <th>Status</th>
-                    <th class="text-end">Details</th>
-                  </tr>
-                </thead>
-                <tbody id="taskHistoryBody">
-                  <tr>
-                    <td colspan="6" class="text-center py-4 text-muted">No task history found</td>
-                  </tr>
-                </tbody>
-              </table>
-            </div>
-          </div>
-        </div>
-      </section>
-
-      <!-- Alerts Section -->
-      <section id="alertsSection" class="content-section" style="display:none;">
-        <div class="section-header">
-          <div>
-            <h1 class="page-title">Alerts Dashboard</h1>
-            <p class="page-subtitle">Monitor critical and important notifications.</p>
-          </div>
-          <div class="d-flex gap-2 align-items-center">
-            <div class="form-check form-switch">
-              <input class="form-check-input" type="checkbox" id="alertSoundSwitch" checked>
-              <label class="form-check-label" for="alertSoundSwitch">Alert Sound</label>
-            </div>
-            <div class="dropdown">
-              <button class="btn btn-sm filter-btn dropdown-toggle" type="button" id="filterAlertsDropdown" data-bs-toggle="dropdown">
-                <i class="fas fa-filter me-1"></i>Filter
-              </button>
-              <ul class="dropdown-menu dropdown-menu-end" aria-labelledby="filterAlertsDropdown">
-                <li><a class="dropdown-item active" href="#" data-filter="all">All Alerts</a></li>
-                <li><hr class="dropdown-divider"></li>
-                <li><a class="dropdown-item" href="#" data-filter="critical">Critical</a></li>
-                <li><a class="dropdown-item" href="#" data-filter="warning">Warning</a></li>
-                <li><a class="dropdown-item" href="#" data-filter="info">Info</a></li>
-              </ul>
-            </div>
-          </div>
-        </div>
-
-        <div class="card">
-          <div class="card-body p-0">
-            <div class="table-responsive">
-              <table class="table mb-0">
-                <thead>
-                  <tr>
-                    <th>Time</th>
-                    <th>Bin ID</th>
-                    <th>Location</th>
-                    <th>Alert Type</th>
-                    <th>Status</th>
-                    <th class="text-end">Action</th>
-                  </tr>
-                </thead>
-                <tbody id="alertsTableBody">
-                  <tr>
-                    <td colspan="6" class="text-center py-4 text-muted">No alerts found</td>
-                  </tr>
-                </tbody>
-              </table>
-            </div>
-          </div>
-          <div class="card-footer d-flex justify-content-between align-items-center">
-            <div class="btn-group">
-              <button type="button" class="btn btn-sm btn-outline-secondary" id="markAllReadBtn"><i class="fas fa-check-double me-1"></i>Mark All as Read</button>
-              <button type="button" class="btn btn-sm btn-outline-danger" id="clearAlertsBtn"><i class="fas fa-trash-alt me-1"></i>Clear All</button>
-            </div>
-          </div>
-        </div>
-      </section>
-
-      <!-- My Profile Section -->
-      <section id="myProfileSection" class="content-section" style="display:none;">
-        <div class="section-header">
-          <div>
-            <h1 class="page-title">My Profile</h1>
-            <p class="page-subtitle">Manage your personal information and settings.</p>
-          </div>
-        </div>
-        
-        <!-- Enhanced profile layout with premium card design and better spacing -->
-        <div class="profile-container">
-          <!-- Profile Header Card -->
-          <div class="profile-header-card">
-            <div class="profile-header-content">
-              <div class="profile-picture-wrapper">
-                <img id="profileImg" src="https://ui-avatars.com/api/?name=<?php echo urlencode($_SESSION['name'] ?? 'Janitor'); ?>&background=0D6EFD&color=fff&size=150" 
-                     alt="Profile Picture" class="profile-picture">
-                <input type="file" id="photoInput" accept=".png,.jpg,.jpeg" style="display: none;">
-                <button type="button" class="profile-edit-btn" id="changePhotoBtn" title="Change Photo" aria-label="Change profile photo" aria-controls="photoInput" tabindex="0">
-                  <i class="fa-solid fa-camera"></i>
-                </button>
-              </div>
-              <div class="profile-info">
-                <h2 class="profile-name"><?php echo htmlspecialchars($_SESSION['name'] ?? 'Janitor'); ?></h2>
-                <p class="profile-role">Janitor</p>
-                <div id="photoMessage" class="validation-message"></div>
-              </div>
-            </div>
-          </div>
-
-          <!-- Profile Content Grid -->
-          <div class="profile-content-grid">
-            <!-- Left Column - Quick Stats -->
-            <div class="profile-sidebar">
-              <div class="profile-stats-card">
-                <h6 class="stats-title">Quick Stats</h6>
-                <div class="stat-item">
-                  <span class="stat-label">Tasks Completed</span>
-                  <span class="stat-value"><?php echo intval($completedToday); ?></span>
-                </div>
-                <div class="stat-item">
-                  <span class="stat-label">Bins Managed</span>
-                  <span class="stat-value"><?php echo intval($assignedBins); ?></span>
-                </div>
-                <div class="stat-item">
-                  <span class="stat-label">Member Since</span>
-                  <span class="stat-value">2024</span>
-                </div>
-              </div>
-
-              <div class="profile-menu-card">
-                <h6 class="menu-title">Settings</h6>
-                <a href="#personal-info" class="profile-menu-item active" data-bs-toggle="list">
-                  <i class="fa-solid fa-user"></i>
-                  <span>Personal Information</span>
-                </a>
-                <a href="#change-password" class="profile-menu-item" data-bs-toggle="list">
-                  <i class="fa-solid fa-key"></i>
-                  <span>Change Password</span>
-                </a>
-              </div>
-            </div>
-
-            <!-- Right Column - Forms -->
-            <div class="profile-main">
-              <div class="tab-content">
-                <!-- Personal Information Tab -->
-                <div class="tab-pane fade show active" id="personal-info">
-                  <div class="profile-form-card">
-                    <div class="form-card-header">
-                      <h5><i class="fa-solid fa-user-circle me-2"></i>Personal Information</h5>
-                    </div>
-                    <div class="form-card-body">
-                      <div id="personalInfoAlert" class="alert alert-message" role="alert"></div>
-                      <form id="personalInfoForm">
-                        <div class="form-row">
-                          <div class="form-group">
-                            <label class="form-label">First Name</label>
-                            <input type="text" class="form-control" id="firstName" value="<?php echo explode(' ', $_SESSION['name'] ?? 'John')[0]; ?>" required>
-                            <div class="validation-message"></div>
-                          </div>
-                          <div class="form-group">
-                            <label class="form-label">Last Name</label>
-                            <input type="text" class="form-control" id="lastName" value="<?php echo explode(' ', $_SESSION['name'] ?? 'Doe')[1] ?? ''; ?>" required>
-                            <div class="validation-message"></div>
-                          </div>
-                        </div>
-                        <div class="form-group">
-                          <label class="form-label">Email Address</label>
-                          <input type="email" class="form-control" id="email" value="<?php echo htmlspecialchars($_SESSION['email'] ?? 'janitor@example.com'); ?>" required>
-                          <div class="validation-message"></div>
-                        </div>
-                        <div class="form-group">
-                          <label class="form-label">Phone Number</label>
-                          <input type="tel" class="form-control" id="phoneNumber" value="+1 (555) 123-4567" placeholder="11 digits">
-                          <div class="validation-message"></div>
-                        </div>
-                        <div class="form-group">
-                          <label class="form-label">Assigned Area</label>
-                          <input type="text" class="form-control" value="Downtown District" readonly style="background-color: #f5f5f5; cursor: not-allowed;">
-                        </div>
-                        <button type="submit" class="btn btn-primary btn-lg">
-                          <i class="fa-solid fa-save me-2"></i>Save Changes
-                        </button>
-                      </form>
-                    </div>
-                  </div>
-                </div>
-                
-                <!-- Change Password Tab -->
-                <div class="tab-pane fade" id="change-password">
-                  <div class="profile-form-card">
-                    <div class="form-card-header">
-                      <h5><i class="fa-solid fa-lock me-2"></i>Change Password</h5>
-                    </div>
-                    <div class="form-card-body">
-                      <div id="passwordAlert" class="alert alert-message" role="alert"></div>
-                      <form id="changePasswordForm">
-                        <div class="form-group">
-                          <label class="form-label">Current Password</label>
-                          <div class="password-input-container">
-                            <input type="password" class="form-control password-input" id="currentPassword" placeholder="Enter current password" required>
-                            <button type="button" class="password-toggle-btn" data-target="#currentPassword">
-                              <i class="fa-solid fa-eye"></i>
-                            </button>
-                          </div>
-                          <div class="validation-message"></div>
-                        </div>
-                        <div class="form-group">
-                          <label class="form-label">New Password</label>
-                          <div class="password-input-container">
-                            <input type="password" class="form-control password-input" id="newPassword" placeholder="Enter new password" required>
-                            <button type="button" class="password-toggle-btn" data-target="#newPassword">
-                              <i class="fa-solid fa-eye"></i>
-                            </button>
-                          </div>
-                          <div class="validation-message"></div>
-                          <div class="password-strength">
-                            <small>Password strength:</small>
-                            <div class="strength-bar">
-                              <div class="strength-fill"></div>
-                            </div>
-                          </div>
-                        </div>
-                        <div class="form-group">
-                          <label class="form-label">Confirm New Password</label>
-                          <div class="password-input-container">
-                            <input type="password" class="form-control password-input" id="confirmNewPassword" placeholder="Confirm new password" required>
-                            <button type="button" class="password-toggle-btn" data-target="#confirmNewPassword">
-                              <i class="fa-solid fa-eye"></i>
-                            </button>
-                          </div>
-                          <div class="validation-message"></div>
-                        </div>
-                        <button type="submit" class="btn btn-primary btn-lg">
-                          <i class="fa-solid fa-lock me-2"></i>Update Password
-                        </button>
-                      </form>
-                    </div>
-                  </div>
-                </div>
-              </div>
-            </div>
-          </div>
-        </div>
-      </section>
     </main>
   </div>
 
-  <!-- Status Update Modal -->
-  <div class="modal fade" id="statusUpdateModal" tabindex="-1">
-    <div class="modal-dialog">
-      <div class="modal-content">
-        <div class="modal-header">
-          <h5 class="modal-title">Update Bin Status</h5>
-          <button type="button" class="btn-close" data-bs-dismiss="modal"></button>
-        </div>
-        <div class="modal-body">
-          <form id="statusUpdateForm">
-            <input type="hidden" id="binIdInput">
-            <div class="mb-3">
-              <label for="statusSelect" class="form-label">Status <span class="text-danger">*</span></label>
-              <select class="form-select form-select-lg" id="statusSelect" required>
-                <option value="" disabled selected>Select status...</option>
-                <option value="empty">Empty</option>
-                <option value="in_progress">In Progress</option>
-                <option value="full">Full</option>
-                <option value="needs_attention">Needs Attention</option>
-                <option value="out_of_service">Out of Service</option>
-              </select>
-            </div>
-            <div class="mb-4">
-              <label for="notesInput" class="form-label">Notes <small class="text-muted">(Optional)</small></label>
-              <textarea class="form-control" id="notesInput" rows="3" placeholder="Add any additional notes..."></textarea>
-            </div>
-          </form>
-        </div>
-        <div class="modal-footer">
-          <button type="button" class="btn btn-outline-secondary" data-bs-dismiss="modal">Cancel</button>
-          <button type="button" class="btn btn-primary" id="updateStatusBtn"><i class="fas fa-save me-1"></i>Update Status</button>
-        </div>
-      </div>
-    </div>
-  </div>
-
-  <!-- Notifications Dropdown Panel -->
-  <div class="modal fade" id="notificationsModal" tabindex="-1">
-    <div class="modal-dialog modal-dialog-scrollable">
-      <div class="modal-content">
-        <div class="modal-header">
-          <h5 class="modal-title"><i class="fas fa-bell me-2"></i>Notifications</h5>
-          <button type="button" class="btn-close" data-bs-dismiss="modal"></button>
-        </div>
-        <div class="modal-body p-0">
-          <div id="notificationsPanel">
-            <div class="text-center py-4 text-muted">
-              <i class="fas fa-inbox" style="font-size: 40px; opacity: 0.5;"></i>
-              <p class="mt-2">No notifications</p>
-            </div>
-          </div>
-        </div>
-      </div>
-    </div>
-  </div>
-
-  <!-- Task History Details Modal -->
-  <div class="modal fade" id="taskDetailsModal" tabindex="-1">
-    <div class="modal-dialog">
-      <div class="modal-content">
-        <div class="modal-header">
-          <h5 class="modal-title"><i class="fas fa-info-circle me-2"></i>Task Details</h5>
-          <button type="button" class="btn-close" data-bs-dismiss="modal"></button>
-        </div>
-        <div class="modal-body">
-          <div class="mb-3">
-            <label class="form-label fw-bold">Date & Time</label>
-            <p id="detailDate" class="mb-0"></p>
-          </div>
-          <div class="mb-3">
-            <label class="form-label fw-bold">Bin ID</label>
-            <p id="detailBinId" class="mb-0"></p>
-          </div>
-          <div class="mb-3">
-            <label class="form-label fw-bold">Location</label>
-            <p id="detailLocation" class="mb-0"></p>
-          </div>
-          <div class="mb-3">
-            <label class="form-label fw-bold">Action</label>
-            <p id="detailAction" class="mb-0"></p>
-          </div>
-          <div class="mb-3">
-            <label class="form-label fw-bold">Status</label>
-            <p id="detailStatus" class="mb-0"></p>
-          </div>
-          <div class="mb-3">
-            <label class="form-label fw-bold">Notes</label>
-            <p id="detailNotes" class="mb-0"></p>
-          </div>
-        </div>
-        <div class="modal-footer">
-          <button type="button" class="btn btn-secondary" data-bs-dismiss="modal">Close</button>
-        </div>
-      </div>
-    </div>
-  </div>
-
-  <!-- Handle Alert Modal -->
-  <div class="modal fade" id="handleAlertModal" tabindex="-1">
-    <div class="modal-dialog">
-      <div class="modal-content">
-        <div class="modal-header">
-          <h5 class="modal-title"><i class="fas fa-check-circle me-2"></i>Handle Alert</h5>
-          <button type="button" class="btn-close" data-bs-dismiss="modal"></button>
-        </div>
-        <div class="modal-body">
-          <form id="handleAlertForm">
-            <input type="hidden" id="handleAlertBinId">
-            <div class="mb-3">
-              <label class="form-label fw-bold">Bin ID</label>
-              <p id="handleBinId" class="mb-0"></p>
-            </div>
-            <div class="mb-3">
-              <label class="form-label fw-bold">Location</label>
-              <p id="handleLocation" class="mb-0"></p>
-            </div>
-            <div class="mb-3">
-              <label class="form-label">Action Taken</label>
-              <select class="form-control form-select" id="handleAction" required>
-                <option value="">Select action...</option>
-                <option value="emptied">Bin Emptied</option>
-                <option value="maintenance">Maintenance Performed</option>
-                <option value="inspected">Bin Inspected</option>
-                <option value="repaired">Bin Repaired</option>
-                <option value="other">Other</option>
-              </select>
-            </div>
-            <div class="mb-3">
-              <label class="form-label">Notes</label>
-              <textarea class="form-control" id="handleNotes" rows="3" placeholder="Enter any additional notes..."></textarea>
-            </div>
-            <div class="mb-3">
-              <label class="form-label">Completion Status</label>
-              <select class="form-control form-select" id="handleStatus" required>
-                <option value="completed">Completed</option>
-                <option value="in_progress">In Progress</option>
-                <option value="pending">Pending</option>
-              </select>
-            </div>
-          </form>
-        </div>
-        <div class="modal-footer">
-          <button type="button" class="btn btn-outline-secondary" data-bs-dismiss="modal">Cancel</button>
-          <button type="button" class="btn btn-primary" onclick="submitHandleAlert()">
-            <i class="fas fa-save me-1"></i>Submit Action
-          </button>
-        </div>
-      </div>
-    </div>
-  </div>
-
-  <!-- Update Bin Status Modal (for Assigned Bins) -->
+  <!-- Update Bin Status Modal (for Assigned Bins) - NO NOTES -->
   <div class="modal fade" id="updateBinStatusModal" tabindex="-1">
     <div class="modal-dialog">
       <div class="modal-content">
@@ -862,14 +630,14 @@ try {
               <select class="form-control form-select" id="updateNewStatus" required>
                 <option value="">Select status...</option>
                 <option value="empty">Empty</option>
-                <option value="in_progress">In Progress</option>
+                <option value="half_full">Half Full</option>
                 <option value="needs_attention">Needs Attention</option>
                 <option value="full">Full</option>
               </select>
             </div>
             <div class="mb-3">
-              <label class="form-label">Action Type</label>
-              <select class="form-control form-select" id="updateActionType" required>
+              <label class="form-label">Action Type (optional)</label>
+              <select class="form-control form-select" id="updateActionType">
                 <option value="">Select action...</option>
                 <option value="emptied">Emptying Bin</option>
                 <option value="cleaning">Cleaning Bin</option>
@@ -877,243 +645,283 @@ try {
                 <option value="maintenance">Maintenance</option>
               </select>
             </div>
-            <div class="mb-3">
-              <label class="form-label">Notes</label>
-              <textarea class="form-control" id="updateStatusNotes" rows="3" placeholder="Enter any additional notes..."></textarea>
-            </div>
           </form>
         </div>
         <div class="modal-footer">
           <button type="button" class="btn btn-outline-secondary" data-bs-dismiss="modal">Cancel</button>
-          <button type="button" class="btn btn-primary" onclick="submitBinStatusUpdate()">
-            <i class="fas fa-save me-1"></i>Update Status
-          </button>
+          <button type="button" class="btn btn-primary" id="updateStatusBtn"><i class="fas fa-save me-1"></i>Update Status</button>
         </div>
       </div>
     </div>
   </div>
 
-  <!-- Logout Confirmation Modal -->
-  <div class="premium-modal" id="logoutModal">
-    <div class="premium-modal-overlay" onclick="closeLogoutModal()"></div>
-    <div class="premium-modal-content">
-      <div class="premium-modal-header">
-        <div class="modal-icon-wrapper">
-          <i class="fa-solid fa-right-from-bracket"></i>
-        </div>
-        <h3 class="modal-title">Confirm Logout</h3>
-        <p class="modal-subtitle">Are you sure you want to logout?</p>
-      </div>
-      <div class="premium-modal-footer">
-        <button class="btn-modal btn-cancel" onclick="closeLogoutModal()">
-          <i class="fa-solid fa-times me-2"></i>Cancel
-        </button>
-        <button class="btn-modal btn-confirm" onclick="confirmLogout()">
-          <i class="fa-solid fa-check me-2"></i>Yes, Logout
-        </button>
-      </div>
-    </div>
-  </div>
-
-  <!-- Privacy Policy Modal -->
-  <div class="info-modal" id="privacyModal">
-    <div class="info-modal-overlay" onclick="closeInfoModal()"></div>
-    <div class="info-modal-content">
-      <div class="info-modal-header">
-        <h2 class="info-modal-title">
-          <i class="fa-solid fa-shield-halved"></i>
-          Privacy Policy
-        </h2>
-        <button class="info-modal-close" onclick="closeInfoModal()">
-          <i class="fa-solid fa-times"></i>
-        </button>
-      </div>
-      <div class="info-modal-body">
-        <p><strong>Effective Date:</strong> November 2025</p>
-        
-        <h3>1. Information We Collect</h3>
-        <p>Smart Trashbin collects information necessary to provide efficient waste management services:</p>
-        <ul>
-          <li><strong>User Account Information:</strong> Name, email address, employee ID, and role designation</li>
-          <li><strong>Bin Usage Data:</strong> Fill levels, collection times, location data, and waste type categorization</li>
-          <li><strong>System Activity:</strong> Task completion records, maintenance logs, and alert notifications</li>
-          <li><strong>Device Information:</strong> IP addresses, browser types, and device identifiers for system security</li>
-        </ul>
-
-        <h3>2. How We Use Your Information</h3>
-        <p>We use collected data to:</p>
-        <ul>
-          <li>Monitor and optimize waste collection routes and schedules</li>
-          <li>Track bin capacity and trigger timely collection alerts</li>
-          <li>Generate reports and analytics for facility management</li>
-          <li>Maintain system security and prevent unauthorized access</li>
-          <li>Improve our smart waste management services</li>
-        </ul>
-
-        <h3>3. Data Security</h3>
-        <p>We implement industry-standard security measures to protect your data, including encryption, secure servers, and regular security audits. Access to personal information is restricted t[...]
-      </div>
-    </div>
-  </div>
-
-  <div class="footer">
-      <div class="footer-content">
-          <div class="footer-links">
-              <a href="#" onclick="openPrivacyModal(event)">Privacy Policy</a>
-              <span class="separator">•</span>
-              <a href="#" onclick="openTermsModal(event)">Terms of Service</a>
-              <span class="separator">•</span>
-              <a href="#" onclick="openSupportModal(event)">Support</a>
-          </div>
-          <p class="footer-text" id="footerText">Making waste management smarter, one bin at a time.</p>
-          <p class="footer-copyright">
-              &copy; 2025 Smart Trashbin. All rights reserved.
-          </p>
-      </div>
-  </div>
+  <?php include_once __DIR__ . '/includes/footer-admin.php'; ?>
 
   <script src="https://cdn.jsdelivr.net/npm/bootstrap@5.3.0/dist/js/bootstrap.bundle.min.js"></script>
   <script src="js/janitor-dashboard.js"></script>
 
   <!-- Client-side refresh to fetch the same server-side stats used above -->
   <script>
-    async function loadDashboardData() {
-      try {
-        const url = new URL(window.location.href);
-        url.searchParams.set('action', 'get_dashboard_stats');
-        const resp = await fetch(url.toString(), { credentials: 'same-origin' });
-        if (!resp.ok) return;
-        const data = await resp.json();
-        if (!data || !data.success) return;
+    (function(){
+      let currentFilter = 'all';
+      let currentSearch = '';
 
-        // Update stat cards
-        document.getElementById('assignedBinsCount').textContent = data.assignedBins ?? (data.bins ? data.bins.length : 0);
-        document.getElementById('pendingTasksCount').textContent = data.pendingTasks ?? 0;
-        document.getElementById('completedTodayCount').textContent = data.completedToday ?? 0;
+      async function loadDashboardData() {
+        try {
+          const url = new URL(window.location.href);
+          url.searchParams.set('action', 'get_dashboard_stats');
+          const resp = await fetch(url.toString(), { credentials: 'same-origin' });
+          if (!resp.ok) return;
+          const data = await resp.json();
+          if (!data || !data.success) return;
 
-        // Rebuild assigned bins table
+          // Update stat cards
+          document.getElementById('assignedBinsCount').textContent = data.assignedBins ?? (data.bins ? data.bins.length : 0);
+          document.getElementById('pendingTasksCount').textContent = data.pendingTasks ?? 0;
+          document.getElementById('completedTodayCount').textContent = data.completedToday ?? 0;
+
+          // Rebuild assigned bins table
+          const tbody = document.getElementById('assignedBinsBody');
+          if (!tbody) return;
+          tbody.innerHTML = '';
+          const bins = data.bins || [];
+          if (!bins.length) {
+            tbody.innerHTML = '<tr><td colspan="6" class="text-center py-4 text-muted">No bins assigned</td></tr>';
+          } else {
+            bins.forEach(b => {
+              const statusMap = {
+                'full': ['danger', 'Full'],
+                'empty': ['success', 'Empty'],
+                'half_full': ['warning', 'Half Full'],
+                'needs_attention': ['info', 'Needs Attention'],
+                'out_of_service': ['secondary', 'Out of Service'],
+                'disabled': ['secondary', 'Disabled']
+              };
+              // normalize in case some records still use 'in_progress' – treat them as half_full
+              let statusKey = (b.status || '').toString();
+              if (statusKey === 'in_progress') statusKey = 'half_full';
+
+              const meta = statusMap[statusKey] || ['secondary', statusKey || 'N/A'];
+              const lastEmptied = b.last_emptied || b.updated_at || 'N/A';
+              const binCode = b.bin_code || b.bin_id;
+              const type = b.type || '';
+              const escapedBinId = parseInt(b.bin_id,10);
+              tbody.insertAdjacentHTML('beforeend', `
+                <tr data-bin-id="${escapedBinId}" data-status="${encodeURIComponent(statusKey)}">
+                  <td><strong>${escapeHtml(binCode)}</strong></td>
+                  <td>${escapeHtml(b.location || '')}</td>
+                  <td>${escapeHtml(type)}</td>
+                  <td><span class="badge bg-${meta[0]}">${escapeHtml(meta[1])}</span></td>
+                  <td>${escapeHtml(lastEmptied)}</td>
+                  <td class="text-end"><button class="btn btn-sm btn-primary" onclick="openUpdateBinStatusModal(${escapedBinId})">Update</button></td>
+                </tr>
+              `);
+            });
+          }
+
+          // Rebuild recent alerts table: show ALL assigned bins (as requested)
+          const alertsTbody = document.getElementById('recentAlertsBody');
+          if (!alertsTbody) return;
+          const alerts = (data.bins || []); // show all assigned bins
+          alertsTbody.innerHTML = '';
+          if (!alerts.length) {
+            alertsTbody.innerHTML = '<tr><td colspan="5" class="text-center py-4 text-muted">No recent alerts</td></tr>';
+          } else {
+            alerts.forEach(b => {
+              let statusKey = (b.status || '').toString();
+              if (statusKey === 'in_progress') statusKey = 'half_full';
+              const statusMap = {
+                'full': ['danger', 'Full'],
+                'empty': ['success', 'Empty'],
+                'half_full': ['warning', 'Half Full'],
+                'needs_attention': ['info', 'Needs Attention'],
+                'out_of_service': ['secondary', 'Out of Service'],
+                'disabled': ['secondary', 'Disabled']
+              };
+              const meta = statusMap[statusKey] || ['secondary', statusKey || 'N/A'];
+              const time = b.last_emptied || b.updated_at || b.created_at || 'N/A';
+              const binCode = b.bin_code || b.bin_id;
+              const location = b.location || '';
+              alertsTbody.insertAdjacentHTML('beforeend', `
+                <tr>
+                  <td>${escapeHtml(time)}</td>
+                  <td><strong>${escapeHtml(binCode)}</strong></td>
+                  <td>${escapeHtml(location)}</td>
+                  <td><span class="badge bg-${meta[0]}">${escapeHtml(meta[1])}</span></td>
+                  <td class="text-end"><a href="bins.php?action=get_details&bin_id=${parseInt(b.bin_id,10)}" class="btn btn-sm btn-soft-primary">View</a></td>
+                </tr>
+              `);
+            });
+          }
+
+          // Apply client-side filter/search after table rebuild
+          applyFilterAndSearch();
+        } catch (err) {
+          // silent
+          console.warn('Dashboard refresh error', err);
+        }
+      }
+
+      function escapeHtml(s) {
+        if (s === null || s === undefined) return '';
+        return String(s)
+          .replaceAll('&', '&amp;')
+          .replaceAll('<', '&lt;')
+          .replaceAll('>', '&gt;')
+          .replaceAll('"', '&quot;')
+          .replaceAll("'", '&#039;');
+      }
+
+      // Apply client-side filtering & search on the assigned bins table rows
+      function applyFilterAndSearch() {
         const tbody = document.getElementById('assignedBinsBody');
         if (!tbody) return;
-        if (!data.bins || !data.bins.length) {
-          tbody.innerHTML = '<tr><td colspan="6" class="text-center py-4 text-muted">No bins assigned</td></tr>';
-        } else {
-          tbody.innerHTML = '';
-          data.bins.forEach(b => {
-            const statusMap = {
-              'full': ['danger', 'Full'],
-              'empty': ['success', 'Empty'],
-              'half_full': ['warning', 'Half Full'],
-              'needs_attention': ['info', 'Needs Attention'],
-              'out_of_service': ['secondary', 'Out of Service']
-            };
-            const meta = statusMap[(b.status || '').toString()] || ['secondary', b.status || 'N/A'];
-            const lastEmptied = b.last_emptied || b.updated_at || 'N/A';
-            const binCode = b.bin_code || b.bin_id;
-            const type = b.type || '';
-            tbody.insertAdjacentHTML('beforeend', `
-              <tr>
-                <td><strong>${escapeHtml(binCode)}</strong></td>
-                <td>${escapeHtml(b.location || '')}</td>
-                <td>${escapeHtml(type)}</td>
-                <td><span class="badge bg-${meta[0]}">${escapeHtml(meta[1])}</span></td>
-                <td>${escapeHtml(lastEmptied)}</td>
-                <td class="text-end"><button class="btn btn-sm btn-primary" onclick="openUpdateBinStatusModal(${parseInt(b.bin_id,10)})">Update</button></td>
-              </tr>
-            `);
-          });
-        }
-
-        // Rebuild recent alerts table: show ALL assigned bins (as requested)
-        const alertsTbody = document.getElementById('recentAlertsBody');
-        if (!alertsTbody) return;
-        const alerts = (data.bins || []); // show all assigned bins
-        if (!alerts.length) {
-          alertsTbody.innerHTML = '<tr><td colspan="5" class="text-center py-4 text-muted">No recent alerts</td></tr>';
-        } else {
-          alertsTbody.innerHTML = '';
-          alerts.forEach(b => {
-            const statusMap = {
-              'full': ['danger', 'Full'],
-              'empty': ['success', 'Empty'],
-              'half_full': ['warning', 'Half Full'],
-              'needs_attention': ['info', 'Needs Attention'],
-              'out_of_service': ['secondary', 'Out of Service']
-            };
-            const meta = statusMap[(b.status || '').toString()] || ['secondary', b.status || 'N/A'];
-            const time = b.last_emptied || b.updated_at || b.created_at || 'N/A';
-            const binCode = b.bin_code || b.bin_id;
-            const location = b.location || '';
-            alertsTbody.insertAdjacentHTML('beforeend', `
-              <tr>
-                <td>${escapeHtml(time)}</td>
-                <td><strong>${escapeHtml(binCode)}</strong></td>
-                <td>${escapeHtml(location)}</td>
-                <td><span class="badge bg-${meta[0]}">${escapeHtml(meta[1])}</span></td>
-                <td class="text-end"><a href="bins.php?action=get_details&bin_id=${parseInt(b.bin_id,10)}" class="btn btn-sm btn-soft-primary">View</a></td>
-              </tr>
-            `);
-          });
-        }
-
-      } catch (err) {
-        // silent
-        console.warn('Dashboard refresh error', err);
+        const rows = tbody.querySelectorAll('tr[data-bin-id]');
+        rows.forEach(row => {
+          const statusEncoded = row.getAttribute('data-status') || '';
+          const status = decodeURIComponent(statusEncoded);
+          // filter: if currentFilter is 'all' show all; else show matching status
+          let visible = (currentFilter === 'all') || (status === currentFilter);
+          // search: check text content
+          if (visible && currentSearch) {
+            const text = row.textContent.toLowerCase();
+            visible = text.includes(currentSearch.toLowerCase());
+          }
+          row.style.display = visible ? '' : 'none';
+        });
       }
-    }
 
-    function escapeHtml(s) {
-      if (s === null || s === undefined) return '';
-      return String(s)
-        .replaceAll('&', '&amp;')
-        .replaceAll('<', '&lt;')
-        .replaceAll('>', '&gt;')
-        .replaceAll('"', '&quot;')
-        .replaceAll("'", '&#039;');
-    }
-
-    // Hook up modal-opening helper used in rows
-    function openUpdateBinStatusModal(binId) {
-      // populate minimal info and open modal - page has updateBinStatusModal
-      document.getElementById('updateBinId').value = binId;
-      document.getElementById('updateBinIdDisplay').textContent = binId;
-      const modalEl = document.getElementById('updateBinStatusModal');
-      const modal = new bootstrap.Modal(modalEl);
-      modal.show();
-    }
-
-    document.addEventListener('DOMContentLoaded', function() {
-      loadDashboardData();
-      setInterval(loadDashboardData, 30000); // refresh every 30s
-
-      // keep notification/logout behavior consistent
-      try {
-        const notifBtn = document.getElementById('notificationsBtn');
-        if (notifBtn) {
-          notifBtn.addEventListener('click', function(e) {
-            e.preventDefault();
-            if (typeof openNotificationsModal === 'function') openNotificationsModal(e);
-            else {
-              const modalEl = document.getElementById('notificationsModal');
-              if (modalEl) new bootstrap.Modal(modalEl).show();
+      // Expose modal opening function used in rows
+      window.openUpdateBinStatusModal = function(binId) {
+        // fetch bin details to populate modal for context and to preselect current status
+        fetch('bins.php?action=get_details&bin_id=' + encodeURIComponent(binId), { credentials: 'same-origin' })
+          .then(r => r.json())
+          .then(data => {
+            if (!data || !data.success || !data.bin) {
+              // fallback: prefill minimal
+              document.getElementById('updateBinId').value = binId;
+              document.getElementById('updateBinIdDisplay').textContent = binId;
+              document.getElementById('updateBinLocation').textContent = 'N/A';
+              document.getElementById('updateNewStatus').value = '';
+            } else {
+              const bin = data.bin;
+              // normalize 'in_progress' to 'half_full'
+              let curStatus = bin.status || '';
+              if (curStatus === 'in_progress') curStatus = 'half_full';
+              document.getElementById('updateBinId').value = bin.bin_id || binId;
+              document.getElementById('updateBinIdDisplay').textContent = bin.bin_code || ('Bin ' + bin.bin_id);
+              document.getElementById('updateBinLocation').textContent = bin.location || 'N/A';
+              document.getElementById('updateNewStatus').value = curStatus;
             }
+            // reset action type
+            document.getElementById('updateActionType').value = '';
+            // show modal
+            new bootstrap.Modal(document.getElementById('updateBinStatusModal')).show();
+          }).catch(err => {
+            console.warn('Failed to fetch bin details', err);
+            document.getElementById('updateBinId').value = binId;
+            document.getElementById('updateBinIdDisplay').textContent = binId;
+            document.getElementById('updateBinLocation').textContent = 'N/A';
+            document.getElementById('updateNewStatus').value = '';
+            new bootstrap.Modal(document.getElementById('updateBinStatusModal')).show();
           });
+      };
+
+      // Submit handler for update modal — uses the new janitor endpoint in this file (NO NOTES)
+      async function submitBinStatusUpdate() {
+        const binId = document.getElementById('updateBinId').value;
+        let newStatus = document.getElementById('updateNewStatus').value;
+        const actionType = document.getElementById('updateActionType').value || '';
+
+        if (!newStatus) {
+          alert('Please select a new status');
+          return;
         }
-        const logoutBtn = document.getElementById('logoutBtn');
-        if (logoutBtn) {
-          logoutBtn.addEventListener('click', function(e) {
-            e.preventDefault();
-            if (typeof showLogoutModal === 'function') showLogoutModal(e);
-            else {
-              const modalEl = document.getElementById('logoutModal');
-              if (modalEl) new bootstrap.Modal(modalEl).show();
-              else window.location.href = 'logout.php';
-            }
+
+        // normalize possible 'in_progress' selection (should not happen) — map to half_full
+        if (newStatus === 'in_progress') newStatus = 'half_full';
+
+        try {
+          // Post to this same file's janitor endpoint so janitor session is used and authorization passes
+          const formData = new URLSearchParams();
+          formData.append('action', 'janitor_edit_status');
+          formData.append('bin_id', binId);
+          formData.append('status', newStatus);
+          if (actionType) formData.append('action_type', actionType);
+
+          const resp = await fetch(window.location.pathname, {
+            method: 'POST',
+            credentials: 'same-origin',
+            headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+            body: formData.toString()
           });
+
+          const json = await resp.json();
+          if (json && json.success) {
+            // close modal
+            const modalEl = document.getElementById('updateBinStatusModal');
+            const modal = bootstrap.Modal.getInstance(modalEl);
+            if (modal) modal.hide();
+
+            // refresh table and stats (this reloads from DB so UI and DB stay in sync)
+            await loadDashboardData();
+
+            // show success
+            alert('Status updated successfully');
+          } else {
+            alert((json && json.message) ? json.message : 'Failed to update status');
+          }
+        } catch (err) {
+          console.error('Update failed', err);
+          alert('Server error while updating status');
         }
-      } catch (err) {
-        console.warn('Header handlers error', err);
       }
-    });
+
+      // Hook up update button
+      document.addEventListener('click', function(e) {
+        if (e.target && e.target.closest && e.target.closest('#updateStatusBtn')) {
+          e.preventDefault();
+          submitBinStatusUpdate();
+        }
+      });
+
+      // Search input wiring (client-side)
+      document.addEventListener('DOMContentLoaded', function() {
+        const searchInput = document.getElementById('searchBinsInput');
+        if (searchInput) {
+          searchInput.addEventListener('input', function() {
+            currentSearch = this.value.trim();
+            applyFilterAndSearch();
+          });
+        }
+
+        // Filter items wiring (assigned bins dropdown inside assignedBinsSection)
+        const assignedSection = document.getElementById('assignedBinsSection');
+        if (assignedSection) {
+          assignedSection.addEventListener('click', function(e) {
+            const target = e.target.closest && e.target.closest('.dropdown-item');
+            if (!target) return;
+            e.preventDefault();
+            let filter = target.getAttribute('data-filter') || 'all';
+            if (filter === 'in_progress') filter = 'half_full';
+            currentFilter = filter;
+            // update visual active state
+            assignedSection.querySelectorAll('.dropdown-menu .dropdown-item').forEach(it => it.classList.remove('active'));
+            target.classList.add('active');
+            // request server for filtered bins
+            loadDashboardData(filter);
+          });
+        }
+
+        // initial load and periodic refresh
+        loadDashboardData();
+        setInterval(loadDashboardData, 30000); // refresh every 30s
+      });
+
+      // Expose function to externally refresh assigned bins
+      window.refreshAssignedBins = loadDashboardData;
+
+    })();
   </script>
 </body>
 </html>
