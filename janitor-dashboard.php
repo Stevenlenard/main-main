@@ -58,14 +58,14 @@ if ($_SERVER['REQUEST_METHOD'] === 'GET' && isset($_GET['action']) && $_GET['act
             $todayStart = date('Y-m-d') . ' 00:00:00';
             $todayEnd = date('Y-m-d') . ' 23:59:59';
 
-            // 1) try tasks table
+            // Try a set of common tables for a completed/emptied action
             $tryTables = [
-                "tasks" => "SELECT COUNT(*) AS c FROM tasks WHERE completed_by = " . intval($janitorId) . " AND DATE(completed_at) = CURDATE()",
-                "task_history" => "SELECT COUNT(*) AS c FROM task_history WHERE performed_by = " . intval($janitorId) . " AND DATE(performed_at) = CURDATE()",
-                "bin_logs" => "SELECT COUNT(*) AS c FROM bin_logs WHERE performed_by = " . intval($janitorId) . " AND (action = 'emptied' OR action = 'completed') AND DATE(created_at) = CURDATE()",
-                "activities" => "SELECT COUNT(*) AS c FROM activities WHERE user_id = " . intval($janitorId) . " AND action IN ('emptied','completed') AND DATE(created_at) = CURDATE()"
+                "SELECT COUNT(*) AS c FROM tasks WHERE completed_by = " . intval($janitorId) . " AND DATE(completed_at) = CURDATE()",
+                "SELECT COUNT(*) AS c FROM task_history WHERE performed_by = " . intval($janitorId) . " AND DATE(performed_at) = CURDATE()",
+                "SELECT COUNT(*) AS c FROM bin_logs WHERE performed_by = " . intval($janitorId) . " AND (action = 'emptied' OR action = 'completed') AND DATE(created_at) = CURDATE()",
+                "SELECT COUNT(*) AS c FROM activities WHERE user_id = " . intval($janitorId) . " AND action IN ('emptied','completed') AND DATE(created_at) = CURDATE()"
             ];
-            foreach ($tryTables as $table => $sql) {
+            foreach ($tryTables as $sql) {
                 $r = $conn->query($sql);
                 if ($r && $row = $r->fetch_assoc()) {
                     $completedToday = intval($row['c'] ?? 0);
@@ -98,6 +98,7 @@ $fullBins = 0;
 $pendingTasks = 0;
 $completedToday = 0;
 $dashboard_bins = [];
+$recent_alerts = [];
 
 try {
     if ($janitorId > 0) {
@@ -124,13 +125,17 @@ try {
             while ($r = $bins_res->fetch_assoc()) $dashboard_bins[] = $r;
         }
 
+        // NOTE: Show all assigned bins in the Recent Alerts table per request.
+        // Previously we filtered only true 'alerts' (full/needs_attention). Now show all assigned bins.
+        $recent_alerts = $dashboard_bins;
+
         // completed today (same heuristic as AJAX)
         $completedToday = 0;
         $tryTables = [
-            "tasks" => "SELECT COUNT(*) AS c FROM tasks WHERE completed_by = " . intval($janitorId) . " AND DATE(completed_at) = CURDATE()",
-            "task_history" => "SELECT COUNT(*) AS c FROM task_history WHERE performed_by = " . intval($janitorId) . " AND DATE(performed_at) = CURDATE()",
-            "bin_logs" => "SELECT COUNT(*) AS c FROM bin_logs WHERE performed_by = " . intval($janitorId) . " AND (action = 'emptied' OR action = 'completed') AND DATE(created_at) = CURDATE()",
-            "activities" => "SELECT COUNT(*) AS c FROM activities WHERE user_id = " . intval($janitorId) . " AND action IN ('emptied','completed') AND DATE(created_at) = CURDATE()"
+            "SELECT COUNT(*) AS c FROM tasks WHERE completed_by = " . intval($janitorId) . " AND DATE(completed_at) = CURDATE()",
+            "SELECT COUNT(*) AS c FROM task_history WHERE performed_by = " . intval($janitorId) . " AND DATE(performed_at) = CURDATE()",
+            "SELECT COUNT(*) AS c FROM bin_logs WHERE performed_by = " . intval($janitorId) . " AND (action = 'emptied' OR action = 'completed') AND DATE(created_at) = CURDATE()",
+            "SELECT COUNT(*) AS c FROM activities WHERE user_id = " . intval($janitorId) . " AND action IN ('emptied','completed') AND DATE(created_at) = CURDATE()"
         ];
         foreach ($tryTables as $sql) {
             $r = $conn->query($sql);
@@ -294,9 +299,37 @@ try {
                   </tr>
                 </thead>
                 <tbody id="recentAlertsBody">
+                  <?php if (empty($recent_alerts)): ?>
                   <tr>
                     <td colspan="5" class="text-center py-4 text-muted">No recent alerts</td>
                   </tr>
+                  <?php else: ?>
+                    <?php foreach ($recent_alerts as $a): ?>
+                      <tr>
+                        <td><?php echo htmlspecialchars($a['last_emptied'] ?? $a['updated_at'] ?? $a['created_at'] ?? 'N/A'); ?></td>
+                        <td><strong><?php echo htmlspecialchars($a['bin_code'] ?? $a['bin_id']); ?></strong></td>
+                        <td><?php echo htmlspecialchars($a['location'] ?? ''); ?></td>
+                        <td>
+                          <?php
+                            $s = $a['status'] ?? '';
+                            $display = match(strtolower($s)) {
+                              'full' => 'Full',
+                              'empty' => 'Empty',
+                              'half_full' => 'Half Full',
+                              'needs_attention' => 'Needs Attention',
+                              'out_of_service' => 'Out of Service',
+                              default => $s
+                            };
+                            $badge = (strtolower($s) === 'full') ? 'danger' : ((strtolower($s) === 'empty') ? 'success' : ((strtolower($s) === 'half_full') ? 'warning' : 'secondary'));
+                          ?>
+                          <span class="badge bg-<?php echo $badge; ?>"><?php echo htmlspecialchars($display); ?></span>
+                        </td>
+                        <td class="text-end">
+                          <a href="bins.php?action=get_details&bin_id=<?php echo intval($a['bin_id']); ?>" class="btn btn-sm btn-soft-primary">View</a>
+                        </td>
+                      </tr>
+                    <?php endforeach; ?>
+                  <?php endif; ?>
                 </tbody>
               </table>
             </div>
@@ -963,32 +996,65 @@ try {
         if (!tbody) return;
         if (!data.bins || !data.bins.length) {
           tbody.innerHTML = '<tr><td colspan="6" class="text-center py-4 text-muted">No bins assigned</td></tr>';
-          return;
+        } else {
+          tbody.innerHTML = '';
+          data.bins.forEach(b => {
+            const statusMap = {
+              'full': ['danger', 'Full'],
+              'empty': ['success', 'Empty'],
+              'half_full': ['warning', 'Half Full'],
+              'needs_attention': ['info', 'Needs Attention'],
+              'out_of_service': ['secondary', 'Out of Service']
+            };
+            const meta = statusMap[(b.status || '').toString()] || ['secondary', b.status || 'N/A'];
+            const lastEmptied = b.last_emptied || b.updated_at || 'N/A';
+            const binCode = b.bin_code || b.bin_id;
+            const type = b.type || '';
+            tbody.insertAdjacentHTML('beforeend', `
+              <tr>
+                <td><strong>${escapeHtml(binCode)}</strong></td>
+                <td>${escapeHtml(b.location || '')}</td>
+                <td>${escapeHtml(type)}</td>
+                <td><span class="badge bg-${meta[0]}">${escapeHtml(meta[1])}</span></td>
+                <td>${escapeHtml(lastEmptied)}</td>
+                <td class="text-end"><button class="btn btn-sm btn-primary" onclick="openUpdateBinStatusModal(${parseInt(b.bin_id,10)})">Update</button></td>
+              </tr>
+            `);
+          });
         }
-        tbody.innerHTML = '';
-        data.bins.forEach(b => {
-          const statusMap = {
-            'full': ['danger', 'Full'],
-            'empty': ['success', 'Empty'],
-            'half_full': ['warning', 'Half Full'],
-            'needs_attention': ['info', 'Needs Attention'],
-            'out_of_service': ['secondary', 'Out of Service']
-          };
-          const meta = statusMap[b.status] || ['secondary', b.status || 'N/A'];
-          const lastEmptied = b.last_emptied || b.updated_at || 'N/A';
-          const binCode = b.bin_code || b.bin_id;
-          const type = b.type || '';
-          tbody.insertAdjacentHTML('beforeend', `
-            <tr>
-              <td><strong>${escapeHtml(binCode)}</strong></td>
-              <td>${escapeHtml(b.location || '')}</td>
-              <td>${escapeHtml(type)}</td>
-              <td><span class="badge bg-${meta[0]}">${escapeHtml(meta[1])}</span></td>
-              <td>${escapeHtml(lastEmptied)}</td>
-              <td class="text-end"><button class="btn btn-sm btn-primary" onclick="openUpdateBinStatusModal(${parseInt(b.bin_id,10)})">Update</button></td>
-            </tr>
-          `);
-        });
+
+        // Rebuild recent alerts table: show ALL assigned bins (as requested)
+        const alertsTbody = document.getElementById('recentAlertsBody');
+        if (!alertsTbody) return;
+        const alerts = (data.bins || []); // show all assigned bins
+        if (!alerts.length) {
+          alertsTbody.innerHTML = '<tr><td colspan="5" class="text-center py-4 text-muted">No recent alerts</td></tr>';
+        } else {
+          alertsTbody.innerHTML = '';
+          alerts.forEach(b => {
+            const statusMap = {
+              'full': ['danger', 'Full'],
+              'empty': ['success', 'Empty'],
+              'half_full': ['warning', 'Half Full'],
+              'needs_attention': ['info', 'Needs Attention'],
+              'out_of_service': ['secondary', 'Out of Service']
+            };
+            const meta = statusMap[(b.status || '').toString()] || ['secondary', b.status || 'N/A'];
+            const time = b.last_emptied || b.updated_at || b.created_at || 'N/A';
+            const binCode = b.bin_code || b.bin_id;
+            const location = b.location || '';
+            alertsTbody.insertAdjacentHTML('beforeend', `
+              <tr>
+                <td>${escapeHtml(time)}</td>
+                <td><strong>${escapeHtml(binCode)}</strong></td>
+                <td>${escapeHtml(location)}</td>
+                <td><span class="badge bg-${meta[0]}">${escapeHtml(meta[1])}</span></td>
+                <td class="text-end"><a href="bins.php?action=get_details&bin_id=${parseInt(b.bin_id,10)}" class="btn btn-sm btn-soft-primary">View</a></td>
+              </tr>
+            `);
+          });
+        }
+
       } catch (err) {
         // silent
         console.warn('Dashboard refresh error', err);
