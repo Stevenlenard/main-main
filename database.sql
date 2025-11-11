@@ -120,6 +120,9 @@ CREATE TABLE IF NOT EXISTS notifications (
     INDEX idx_created_at (created_at)
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
 
+ALTER TABLE reports
+ADD COLUMN description TEXT AFTER report_name;
+
 CREATE TABLE IF NOT EXISTS reports (
     report_id INT AUTO_INCREMENT PRIMARY KEY,
     report_name VARCHAR(255) NOT NULL,
